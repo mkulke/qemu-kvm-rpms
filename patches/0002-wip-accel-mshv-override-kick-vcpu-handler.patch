@@ -1,0 +1,103 @@
+From 660cda01a2a540eed605615e1a8be21b54f45237 Mon Sep 17 00:00:00 2001
+From: Magnus Kulke <magnuskulke@linux.microsoft.com>
+Date: Wed, 22 Jul 2026 17:23:16 +0200
+Subject: [PATCH] wip: accel/mshv: override kick-vcpu handler
+
+Signed-off-by: Magnus Kulke <magnuskulke@linux.microsoft.com>
+---
+ accel/mshv/mshv-all.c       | 22 ++++++++++++++++++++++
+ include/hw/core/cpu.h       | 12 ++++++++++++
+ include/system/mshv_int.h   |  2 ++
+ target/i386/mshv/mshv-cpu.c |  2 +-
+ 4 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/accel/mshv/mshv-all.c b/accel/mshv/mshv-all.c
+index 46423c667e..2d8b39c878 100644
+--- a/accel/mshv/mshv-all.c
++++ b/accel/mshv/mshv-all.c
+@@ -720,11 +720,33 @@ static void mshv_handle_interrupt(CPUState *cpu, int mask)
+     }
+ }
+ 
++/*
++ * We cannot use the generic cpus_kick_thread() here.  MSHV_RUN_VP
++ * might can consume SIG_IPI but return a different exit reason, so we cannot
++ * indicate that the VP no longer needs another signal.
++ */
++static void mshv_kick_vcpu_thread(CPUState *cpu)
++{
++    int err;
++
++    if (qemu_cpu_is_self(cpu)) {
++        return;
++    }
++
++    err = pthread_kill(cpu->thread->thread, SIG_IPI);
++    if (err && err != ESRCH) {
++        error_report("failed to kick MSHV vCPU %d: %s",
++                     cpu->cpu_index, strerror(err));
++        abort();
++    }
++}
++
+ static void mshv_accel_ops_class_init(ObjectClass *oc, const void *data)
+ {
+     AccelOpsClass *ops = ACCEL_OPS_CLASS(oc);
+ 
+     ops->create_vcpu_thread = mshv_start_vcpu_thread;
++    ops->kick_vcpu_thread = mshv_kick_vcpu_thread;
+     ops->cpu_thread_is_idle = mshv_vcpu_thread_is_idle;
+     ops->synchronize_post_init = mshv_cpu_synchronize_post_init;
+     ops->synchronize_post_reset = mshv_cpu_synchronize_post_reset;
+diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
+index fadd6c5ac0..6f0d19224b 100644
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -951,6 +951,18 @@ CPUState *cpu_by_arch_id(int64_t id);
+ 
+ void cpu_interrupt(CPUState *cpu, int mask);
+ 
++/**
++ * cpu_test_interrupt:
++ * @cpu: The CPU to check interrupt(s) on.
++ * @mask: The interrupts to check.
++ *
++ * Checks if any of interrupts in @mask are pending on @cpu.
++ */
++static inline bool cpu_test_interrupt(CPUState *cpu, int mask)
++{
++    return qatomic_load_acquire(&cpu->interrupt_request) & mask;
++}
++
+ /**
+  * cpu_set_pc:
+  * @cpu: The CPU to set the program counter for.
+diff --git a/include/system/mshv_int.h b/include/system/mshv_int.h
+index f87cdfc8de..475e51a131 100644
+--- a/include/system/mshv_int.h
++++ b/include/system/mshv_int.h
+@@ -16,6 +16,8 @@
+ 
+ #define MSHV_MSR_ENTRIES_COUNT 64
+ 
++#define MSHV_HV_INTERRUPTION_TYPE_EXT_INT     0
++
+ typedef struct hyperv_message hv_message;
+ 
+ typedef struct MshvHvCallArgs {
+diff --git a/target/i386/mshv/mshv-cpu.c b/target/i386/mshv/mshv-cpu.c
+index 29093e7df1..4fee3969ad 100644
+--- a/target/i386/mshv/mshv-cpu.c
++++ b/target/i386/mshv/mshv-cpu.c
+@@ -1574,7 +1574,7 @@ static int handle_interrupt_deliverable(CPUState *cpu,
+ 
+     /* we check whether the vcpu is halted first */
+     activity_assoc->name = HV_REGISTER_INTERNAL_ACTIVITY_STATE;
+-    ret = mshv_get_generic_regs(cpu, activity_assoc, 1);
++    ret = get_generic_regs(cpu, activity_assoc, 1);
+     if (ret < 0) {
+         error_report("failed to read activity state before PIC delivery");
+         return -1;
+-- 
+2.34.1
+

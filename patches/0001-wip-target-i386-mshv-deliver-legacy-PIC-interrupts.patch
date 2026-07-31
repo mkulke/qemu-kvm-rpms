@@ -1,0 +1,405 @@
+From 7226b02399d5e65938946fbfc1bdb3ef8d71dc67 Mon Sep 17 00:00:00 2001
+From: Magnus Kulke <magnuskulke@microsoft.com>
+Date: Wed, 29 Jul 2026 10:40:06 +0200
+Subject: [PATCH] wip: target/i386/mshv: deliver legacy PIC interrupts
+
+MSHV provides an hypervisor-backed LAPIC, while QEMU owns the legacy PIC.
+
+Once the PIC asserts an interrupt, we request an "interruption
+deliverability" notification, so we get a dedicated exit once the
+partition ready to accept it. We then inject the selected vector via a
+"PendingEvent" register and resume a halted VP when necessary.
+
+Signed-off-by: Magnus Kulke <magnuskulke@microsoft.com>
+---
+ accel/mshv/mshv-all.c          |  12 +++-
+ accel/mshv/trace-events        |   1 +
+ hw/i386/x86-cpu.c              |   6 +-
+ include/hw/hyperv/hvgdk_mini.h |  41 ++++++++++-
+ include/system/mshv.h          |   2 +
+ include/system/mshv_int.h      |   1 +
+ meson.build                    |   1 +
+ target/i386/mshv/mshv-cpu.c    | 128 +++++++++++++++++++++++++++++++++
+ target/i386/mshv/trace-events  |   7 ++
+ target/i386/mshv/trace.h       |   2 +
+ 10 files changed, 197 insertions(+), 4 deletions(-)
+ create mode 100644 target/i386/mshv/trace-events
+ create mode 100644 target/i386/mshv/trace.h
+
+diff --git a/accel/mshv/mshv-all.c b/accel/mshv/mshv-all.c
+index d7df89dbd2..46423c667e 100644
+--- a/accel/mshv/mshv-all.c
++++ b/accel/mshv/mshv-all.c
+@@ -710,6 +710,16 @@ static bool mshv_vcpu_thread_is_idle(CPUState *cpu)
+     return false;
+ }
+ 
++static void mshv_handle_interrupt(CPUState *cpu, int mask)
++{
++    int old_mask = qatomic_fetch_or(&cpu->interrupt_request, mask);
++
++    trace_mshv_handle_interrupt(cpu->cpu_index, mask);
++    if (!(old_mask & mask) && !qemu_cpu_is_self(cpu)) {
++        qemu_cpu_kick(cpu);
++    }
++}
++
+ static void mshv_accel_ops_class_init(ObjectClass *oc, const void *data)
+ {
+     AccelOpsClass *ops = ACCEL_OPS_CLASS(oc);
+@@ -721,7 +731,7 @@ static void mshv_accel_ops_class_init(ObjectClass *oc, const void *data)
+     ops->synchronize_state = mshv_cpu_synchronize;
+     ops->synchronize_pre_loadvm = mshv_cpu_synchronize_pre_loadvm;
+     ops->cpus_are_resettable = mshv_cpus_are_resettable;
+-    ops->handle_interrupt = generic_handle_interrupt;
++    ops->handle_interrupt = mshv_handle_interrupt;
+ }
+ 
+ static const TypeInfo mshv_accel_ops_type = {
+diff --git a/accel/mshv/trace-events b/accel/mshv/trace-events
+index a4dffeb24a..859e8bfb0f 100644
+--- a/accel/mshv/trace-events
++++ b/accel/mshv/trace-events
+@@ -4,6 +4,7 @@
+ # SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ mshv_start_vcpu_thread(const char* thread, uint32_t cpu) "thread=%s cpu_index=%d"
++mshv_interrupt_exit_request(uint32_t cpu) "cpu_index=%d"
+ 
+ mshv_set_memory(bool add, uint64_t gpa, uint64_t size, uint64_t user_addr, bool readonly, int ret) "add=%d gpa=0x%" PRIx64 " size=0x%" PRIx64 " user=0x%" PRIx64 " readonly=%d result=%d"
+ mshv_mem_ioeventfd_add(uint64_t addr, uint32_t size, uint32_t data) "addr=0x%" PRIx64 " size=%d data=0x%x"
+diff --git a/hw/i386/x86-cpu.c b/hw/i386/x86-cpu.c
+index c876e6709e..f9c8c3529d 100644
+--- a/hw/i386/x86-cpu.c
++++ b/hw/i386/x86-cpu.c
+@@ -23,6 +23,7 @@
+ #include "qemu/osdep.h"
+ #include "system/whpx.h"
+ #include "system/cpu-timers.h"
++#include "system/mshv.h"
+ #include "trace.h"
+ 
+ #include "hw/i386/x86.h"
+@@ -45,7 +46,7 @@ static void pic_irq_request(void *opaque, int irq, int level)
+ 
+     trace_x86_pic_interrupt(irq, level);
+     if (cpu_is_apic_enabled(cpu->apic_state) && !kvm_irqchip_in_kernel() &&
+-        !whpx_apic_in_platform()) {
++        !mshv_irqchip_in_kernel() && !whpx_apic_in_platform()) {
+         CPU_FOREACH(cs) {
+             cpu = X86_CPU(cs);
+             if (apic_accept_pic_intr(cpu->apic_state)) {
+@@ -71,7 +72,8 @@ int cpu_get_pic_interrupt(CPUX86State *env)
+     X86CPU *cpu = env_archcpu(env);
+     int intno;
+ 
+-    if (!kvm_irqchip_in_kernel() && !whpx_apic_in_platform()) {
++    if (!kvm_irqchip_in_kernel() && !whpx_apic_in_platform() &&
++        !mshv_irqchip_in_kernel()) {
+         intno = apic_get_interrupt(cpu->apic_state);
+         if (intno >= 0) {
+             return intno;
+diff --git a/include/hw/hyperv/hvgdk_mini.h b/include/hw/hyperv/hvgdk_mini.h
+index d89315f545..769901ce9e 100644
+--- a/include/hw/hyperv/hvgdk_mini.h
++++ b/include/hw/hyperv/hvgdk_mini.h
+@@ -10,8 +10,15 @@
+ #define MSHV_IOCTL  0xB8
+ 
+ typedef enum hv_register_name {
++    /* VP Management Registers */
++    HV_REGISTER_INTERNAL_ACTIVITY_STATE = 0x00000004,
++
+     /* Pending Interruption Register */
+-    HV_REGISTER_PENDING_INTERRUPTION = 0x00010002,
++    HV_REGISTER_PENDING_INTERRUPTION         = 0x00010002,
++    HV_REGISTER_INTERRUPT_STATE              = 0x00010003,
++    HV_REGISTER_PENDING_EVENT0               = 0x00010004,
++    HV_REGISTER_PENDING_EVENT1               = 0x00010005,
++    HV_REGISTER_DELIVERABILITY_NOTIFICATIONS = 0x00010006,
+ 
+     /* X64 User-Mode Registers */
+     HV_X64_REGISTER_RAX     = 0x00020000,
+@@ -255,6 +262,20 @@ union hv_x64_pending_exception_event {
+     };
+ };
+ 
++#define HV_X64_PENDING_EVENT_EXT_INT 5
++
++union hv_x64_pending_ext_int_event {
++    uint64_t as_uint64[2];
++    struct {
++        uint64_t event_pending:1;
++        uint64_t event_type:3;
++        uint64_t reserved0:4;
++        uint64_t vector:8;
++        uint64_t reserved1:48;
++        uint64_t reserved2;
++    };
++};
++
+ union hv_x64_pending_virtualization_fault_event {
+     uint64_t as_uint64[2];
+     struct {
+@@ -385,6 +406,17 @@ union hv_x64_interrupt_state_register {
+     };
+ };
+ 
++union hv_x64_deliverability_notifications_register {
++    uint64_t as_uint64;
++    struct {
++        uint64_t nmi_notification:1;
++        uint64_t interrupt_notification:1;
++        uint64_t interrupt_priority:4;
++        uint64_t reserved:42;
++        uint64_t sints:16;
++    };
++};
++
+ union hv_intercept_suspend_register {
+     uint64_t as_uint64;
+     struct {
+@@ -411,6 +443,7 @@ typedef union hv_register_value {
+     union hv_x64_pending_interruption_register pending_interruption;
+     union hv_x64_msr_npiep_config_contents npiep_config;
+     union hv_x64_pending_exception_event pending_exception_event;
++    union hv_x64_pending_ext_int_event pending_ext_int_event;
+     union hv_x64_pending_virtualization_fault_event
+         pending_virtualization_fault_event;
+     union hv_x64_register_sev_control sev_control;
+@@ -653,6 +686,12 @@ struct hv_x64_intercept_message_header {
+     uint64_t rflags;
+ };
+ 
++struct hv_x64_interruption_deliverable_message {
++    struct hv_x64_intercept_message_header header;
++    uint32_t deliverable_type;
++    uint32_t reserved;
++};
++
+ union hv_x64_io_port_access_info {
+     uint8_t as_uint8;
+     struct {
+diff --git a/include/system/mshv.h b/include/system/mshv.h
+index 8b1fc20c80..abf3cf9ba1 100644
+--- a/include/system/mshv.h
++++ b/include/system/mshv.h
+@@ -40,9 +40,11 @@
+ extern bool mshv_allowed;
+ #define mshv_enabled() (mshv_allowed)
+ #define mshv_msi_via_irqfd_enabled() mshv_enabled()
++#define mshv_irqchip_in_kernel() mshv_enabled()
+ #else /* CONFIG_MSHV_IS_POSSIBLE */
+ #define mshv_enabled() false
+ #define mshv_msi_via_irqfd_enabled() mshv_enabled()
++#define mshv_irqchip_in_kernel() mshv_enabled()
+ #endif
+ 
+ typedef struct MshvState MshvState;
+diff --git a/include/system/mshv_int.h b/include/system/mshv_int.h
+index ad4d001c3c..f87cdfc8de 100644
+--- a/include/system/mshv_int.h
++++ b/include/system/mshv_int.h
+@@ -28,6 +28,7 @@ struct AccelCPUState {
+     int cpufd;
+     bool dirty;
+     MshvHvCallArgs hvcall_args;
++    bool pic_interrupt_window;
+ };
+ 
+ typedef struct MshvMemoryListener {
+diff --git a/meson.build b/meson.build
+index f7b21c818d..ff300acf1b 100644
+--- a/meson.build
++++ b/meson.build
+@@ -3742,6 +3742,7 @@ if have_system or have_user
+     'target/hppa',
+     'target/i386',
+     'target/i386/kvm',
++    'target/i386/mshv',
+     'target/loongarch',
+     'target/mips/tcg',
+     'target/ppc',
+diff --git a/target/i386/mshv/mshv-cpu.c b/target/i386/mshv/mshv-cpu.c
+index c577e284b4..29093e7df1 100644
+--- a/target/i386/mshv/mshv-cpu.c
++++ b/target/i386/mshv/mshv-cpu.c
+@@ -12,6 +12,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qemu/error-report.h"
++#include "qemu/main-loop.h"
+ #include "qemu/memalign.h"
+ #include "qemu/typedefs.h"
+ 
+@@ -1494,12 +1495,133 @@ static int handle_pio(CPUState *cpu, const struct hyperv_message *msg)
+     return handle_pio_non_str(cpu, &info);
+ }
+ 
++static int set_pic_interrupt_window(CPUState *cpu, bool enabled)
++{
++    union hv_x64_deliverability_notifications_register notifications = { 0 };
++    struct hv_register_assoc assoc = { 0 };
++    AccelCPUState *cpu_state = cpu->accel;
++    int ret;
++
++    notifications.interrupt_notification = enabled;
++
++    assoc.name        = HV_REGISTER_DELIVERABILITY_NOTIFICATIONS;
++    assoc.value.reg64 = notifications.as_uint64;
++
++    /* we are already waiting for a PIC interrupt window */
++    if (cpu_state->pic_interrupt_window == enabled) {
++        return 0;
++    }
++
++    trace_mshv_set_pic_interrupt_window(cpu->cpu_index, enabled);
++
++    ret = mshv_set_generic_regs(cpu, &assoc, 1);
++    if (ret < 0) {
++        error_report("failed to set deliverability notifications register");
++        return ret;
++    }
++
++    cpu_state->pic_interrupt_window = enabled;
++    return 0;
++}
++
++static inline int request_pic_interrupt_window(CPUState *cpu)
++{
++    return set_pic_interrupt_window(cpu, true);
++}
++
++static inline int clear_pic_interrupt_window(CPUState *cpu)
++{
++    return set_pic_interrupt_window(cpu, false);
++}
++
++static int handle_interrupt_deliverable(CPUState *cpu,
++                                        const struct hyperv_message *msg)
++{
++    CPUX86State *env = &X86_CPU(cpu)->env;
++    struct hv_x64_interruption_deliverable_message info;
++    union hv_x64_pending_ext_int_event event = { 0 };
++    struct hv_register_assoc assocs[2] = { 0 };
++    struct hv_register_assoc *event_assoc = &assocs[0],
++                             *activity_assoc = &assocs[1];
++    union hv_internal_activity_register activity;
++    bool is_suspended;
++    int ret, vector;
++
++    memcpy(&info, msg->payload, sizeof(info));
++    if (info.deliverable_type != MSHV_HV_INTERRUPTION_TYPE_EXT_INT) {
++        error_report("unexpected deliverable interruption type %u",
++                     info.deliverable_type);
++        return -1;
++    }
++
++    ret = clear_pic_interrupt_window(cpu);
++    if (ret < 0) {
++        error_report("failed to clear PIC interrupt window");
++        return -1;
++    }
++
++    bql_lock();
++    cpu_reset_interrupt(cpu, CPU_INTERRUPT_HARD);
++    vector = cpu_get_pic_interrupt(env);
++    bql_unlock();
++
++    /* vector == -1 means the PIC has no longer a pending interrupt */
++    if (vector < 0) {
++        return 0;
++    }
++
++    trace_mshv_pic_interrupt(cpu->cpu_index, vector);
++
++    /* we check whether the vcpu is halted first */
++    activity_assoc->name = HV_REGISTER_INTERNAL_ACTIVITY_STATE;
++    ret = mshv_get_generic_regs(cpu, activity_assoc, 1);
++    if (ret < 0) {
++        error_report("failed to read activity state before PIC delivery");
++        return -1;
++    }
++
++    event.event_pending = 1;
++    event.event_type    = HV_X64_PENDING_EVENT_EXT_INT;
++    event.vector        = vector;
++
++    event_assoc->name                        = HV_REGISTER_PENDING_EVENT0;
++    event_assoc->value.pending_ext_int_event = event;
++
++    /*
++     * If the vcpu was hlt suspended we clear the suspend bit, otherwise we
++     * only set the pending event.
++     */
++    activity = activity_assoc->value.internal_activity;
++    is_suspended = activity.halt_suspend;
++    if (is_suspended) {
++        activity.halt_suspend = 0;
++        activity_assoc->value.internal_activity = activity;
++    }
++
++    ret = mshv_set_generic_regs(cpu, assocs, is_suspended ? 2 : 1);
++    if (ret < 0) {
++        error_report("failed to set pending event%s",
++                     is_suspended ? " and activity state" : "");
++        return ret;
++    }
++
++    return 0;
++}
++
+ int mshv_run_vcpu(int vm_fd, CPUState *cpu, hv_message *msg, MshvVmExit *exit)
+ {
+     int ret;
+     enum MshvVmExit exit_reason;
+     int cpu_fd = mshv_vcpufd(cpu);
+ 
++    if (cpu_test_interrupt(cpu, CPU_INTERRUPT_HARD)) {
++        ret = request_pic_interrupt_window(cpu);
++        if (ret < 0) {
++            error_report("failed to request PIC interrupt window");
++            return -1;
++        }
++    }
++
+     ret = ioctl(cpu_fd, MSHV_RUN_VP, msg);
+     if (ret < 0) {
+         return MshvVmExitShutdown;
+@@ -1522,6 +1644,12 @@ int mshv_run_vcpu(int vm_fd, CPUState *cpu, hv_message *msg, MshvVmExit *exit)
+             return MshvVmExitSpecial;
+         }
+         return MshvVmExitIgnore;
++    case HVMSG_X64_INTERRUPTION_DELIVERABLE:
++        ret = handle_interrupt_deliverable(cpu, msg);
++        if (ret < 0) {
++            return ret;
++        }
++        return MshvVmExitIgnore;
+     default:
+         break;
+     }
+diff --git a/target/i386/mshv/trace-events b/target/i386/mshv/trace-events
+new file mode 100644
+index 0000000000..347ce040ab
+--- /dev/null
++++ b/target/i386/mshv/trace-events
+@@ -0,0 +1,7 @@
++# Authors: Magnus Kulke <magnuskulke@microsoft.com>
++#
++# SPDX-License-Identifier: GPL-2.0-or-later
++
++mshv_run_vcpu_eintr(uint32_t cpu) "cpu_index=%d"
++mshv_set_pic_interrupt_window(uint32_t cpu, bool enabled) "cpu_index=%d enabled=%d"
++mshv_pic_interrupt(uint32_t cpu, uint8_t vector) "cpu_index=%d vector=0x%x"
+diff --git a/target/i386/mshv/trace.h b/target/i386/mshv/trace.h
+new file mode 100644
+index 0000000000..81b6b655c7
+--- /dev/null
++++ b/target/i386/mshv/trace.h
+@@ -0,0 +1,2 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#include "trace/trace-target_i386_mshv.h"
+-- 
+2.34.1
+
