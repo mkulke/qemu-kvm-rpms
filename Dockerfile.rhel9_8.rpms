@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1.3-labs
+FROM registry.access.redhat.com/ubi9/ubi:9.8-1794186345 as qemu-builder
+
+RUN --mount=type=secret,id=entcrt,target=/run/secrets/entcrt \
+    --mount=type=secret,id=entkey,target=/run/secrets/entkey \
+    --mount=type=bind,source=rhel9_8.repo,target=/etc/yum.repos.d/rhel9_8.repo \
+    dnf install -y rpm-build 'dnf-command(download)' && \
+    dnf download --source --destdir / qemu-kvm && \
+    rpm -ivh /qemu-kvm-*.src.rpm && \
+    dnf builddep -y /root/rpmbuild/SPECS/qemu-kvm.spec
+
+COPY patches/* /root/rpmbuild/SOURCES/
+
+RUN <<'EOF'
+awk 'BEGIN { found=0 }
+	/^Patch[0-9]+:/ { found=NR }
+	{ lines[NR]=$0 }
+	END {
+		for (i=1; i<=NR; i++) {
+		print lines[i]
+		if (i==found) {
+			print "# MSHV patches"
+			print "Patch999: 0003-accel-mshv-skip-double-unmap-of-mem-regions.patch"
+		}
+	}
+}' /root/rpmbuild/SPECS/qemu-kvm.spec > qemu-kvm.spec.new
+EOF
+RUN perl -i -pe 's/^Release: (\d+)/sprintf("Release: %d.mgns", $1+1)/e' qemu-kvm.spec.new
+RUN mv qemu-kvm.spec.new /root/rpmbuild/SPECS/qemu-kvm.spec
+
+RUN rpmbuild -bb --define 'dist .el9_8' /root/rpmbuild/SPECS/qemu-kvm.spec
+
+FROM scratch
+COPY --from=qemu-builder /root/rpmbuild/RPMS/x86_64/*.rpm /

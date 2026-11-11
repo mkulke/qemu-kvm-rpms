@@ -1,0 +1,73 @@
+# syntax=docker/dockerfile:1.3-labs
+FROM quay.io/centos/centos:stream9 AS payload-builder
+
+ARG IMAGE_URL=https://download.fedoraproject.org/pub/fedora/linux/releases/45/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-45-1.4.x86_64.qcow2
+
+RUN dnf -y update && dnf -y install \
+    mtools \
+    wget \
+    dosfstools
+RUN wget $IMAGE_URL -O /tmp/os-image.qcow2
+RUN mkdir cidata
+COPY <<EOF cidata/meta-data
+instance-id: cloud
+local-hostname: cloud
+EOF
+COPY <<-EOF cidata/network-config
+version: 2
+ethernets:
+  eth0:
+    match:
+      macaddress: 00:10:20:30:40:50
+    dhcp4: true
+EOF
+COPY <<-"EOF" cidata/user-data
+#cloud-config
+users:
+- name: "cloud"
+  passwd: "$6$Nj5/QLVsGjcm87Qh$2m1i14vBh1RNHrXXwr4z6Tnn9yDBb4pbWCbvbfT2web8IKzozaT/gW6.1iKyo3GF2atlqyP5nUPquKFjNMNuV0"
+  sudo: "ALL=(ALL) NOPASSWD:ALL"
+  lock_passwd: false
+ssh_pwauth: true
+EOF
+RUN mkdosfs -n CIDATA -C /tmp/cidata.img 8192
+RUN mcopy -oi /tmp/cidata.img -s cidata/user-data ::
+RUN mcopy -oi /tmp/cidata.img -s cidata/meta-data ::
+RUN mcopy -oi /tmp/cidata.img -s cidata/network-config ::
+
+FROM registry.access.redhat.com/ubi9/ubi:9.8-1794186345
+
+COPY ./rpms /root/rpmbuild/RPMS/x86_64
+
+RUN --mount=type=secret,id=entcrt,target=/run/secrets/entcrt \
+    --mount=type=secret,id=entkey,target=/run/secrets/entkey \
+    --mount=type=bind,source=rhel9_8.repo,target=/etc/yum.repos.d/rhel9_8.repo \
+	dnf -y update && \
+    dnf -y install /root/rpmbuild/RPMS/x86_64/*.rpm && \
+    dnf clean all
+
+RUN mkdir -p /var/lib/qemu/
+COPY --from=payload-builder /tmp/os-image.qcow2 /var/lib/qemu/
+COPY --from=payload-builder /tmp/cidata.img /var/lib/qemu/
+
+# run with:
+# `sudo docker run --privileged --rm -it -v /dev/mshv:/dev/mshv -v $PWD/logs:/var/run/qemu/logs -p 2222:2222 qemu-kvm-runner`
+# tail the boot log with `tail -f logs/serial.log` on the host
+# login to the guest with `ssh cloud@localhost -p 2222` w/ password `cloud123`
+
+ENTRYPOINT ["/usr/libexec/qemu-kvm"]
+CMD ["-accel", "mshv", \
+     "-machine", "pc-q35-rhel9.8.0", \
+     "-drive", "if=pflash,format=raw,file=/usr/share/edk2/ovmf/OVMF_CODE.fd,readonly=on", \
+     "-drive", "if=pflash,format=raw,file=/usr/share/edk2/ovmf/OVMF_VARS.fd", \
+     "-display", "none", \
+     "-m", "2048", \
+     "-smp", "2", \
+     "-serial", "file:/var/run/qemu/logs/serial.log", \
+     "-drive", "file=/var/lib/qemu/os-image.qcow2,format=qcow2,if=none,id=os", \
+     "-device", "virtio-blk-pci,drive=os", \
+     "-nographic", \
+     "-drive", "file=/var/lib/qemu/cidata.img,format=raw,if=none,id=cidata", \
+     "-device", "virtio-blk-pci,drive=cidata", \
+     "-netdev", "type=user,id=user-net,hostfwd=tcp::2222-:22", \
+     "-device", "virtio-net,mac=00:10:20:30:40:50,netdev=user-net"]

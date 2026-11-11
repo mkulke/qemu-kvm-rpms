@@ -1,0 +1,147 @@
+From git@z Thu Jan  1 00:00:00 1970
+Subject: [PATCH] accel/mshv: skip double unmap of mem regions
+From: Magnus Kulke <magnuskulke@linux.microsoft.com>
+Date: Thu, 26 Mar 2026 15:40:00 +0100
+Message-Id: <20260326144000.492037-1-magnuskulke@linux.microsoft.com>
+To: qemu-devel@nongnu.org
+Cc: Wei Liu <liuwe@microsoft.com>, Wei Liu <wei.liu@kernel.org>, Magnus Kulke <magnuskulke@microsoft.com>, Magnus Kulke <magnuskulke@linux.microsoft.com>
+List-Id: qemu development <qemu-devel.nongnu.org>
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+This change addresses a regression that was introduced when the dynamic
+mapping handler was removed, from the MSHV controller, breaking OVMF
+support.
+
+We introduce a small uaddr-indexed table to track mapped regions. The
+current logic turns an add into a remove op if a rom-device region is
+currently not in romd_mode.
+
+We could ignore both map + unmap for this condition, but this misses a
+the case of a region transitioning from romd_mode=true => false. In this
+case we still do want to unmap a region.
+
+Fixes: 626e5dc999 (Remove remap overlapping mappings code)
+
+Signed-off-by: Magnus Kulke <magnuskulke@linux.microsoft.com>
+Reviewed-by: Doru Blânzeanu <dblanzeanu@linux.microsoft.com>
+---
+ accel/mshv/mem.c          | 41 ++++++++++++++++++++++++++++++++++++---
+ accel/mshv/mshv-all.c     |  1 +
+ include/system/mshv_int.h |  1 +
+ 3 files changed, 40 insertions(+), 3 deletions(-)
+
+diff --git a/accel/mshv/mem.c b/accel/mshv/mem.c
+index e55c38d4db..db28dcd83c 100644
+--- a/accel/mshv/mem.c
++++ b/accel/mshv/mem.c
+@@ -12,6 +12,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qemu/error-report.h"
++#include "qemu/main-loop.h"
+ #include "linux/mshv.h"
+ #include "system/address-spaces.h"
+ #include "system/mshv.h"
+@@ -165,6 +166,25 @@ static hwaddr align_section(MemoryRegionSection *section, hwaddr *start)
+     return (size - delta) & qemu_real_host_page_mask();
+ }
+ 
++static bool uaddr_is_mapped(MshvMemoryListener *mml, hwaddr start_addr)
++{
++    assert(bql_locked());
++
++    return g_hash_table_contains(mml->mapped_regions,
++                                 GINT_TO_POINTER(start_addr));
++}
++
++static void track_region(MshvMemoryListener *mml, hwaddr start_addr, bool add)
++{
++    assert(bql_locked());
++
++    if (add) {
++        g_hash_table_add(mml->mapped_regions, GINT_TO_POINTER(start_addr));
++    } else {
++        g_hash_table_remove(mml->mapped_regions, GINT_TO_POINTER(start_addr));
++    }
++}
++
+ void mshv_set_phys_mem(MshvMemoryListener *mml, MemoryRegionSection *section,
+                        bool add)
+ {
+@@ -173,15 +193,19 @@ void mshv_set_phys_mem(MshvMemoryListener *mml, MemoryRegionSection *section,
+     bool writable = !area->readonly && !area->rom_device;
+     hwaddr start_addr, mr_offset, size;
+     void *ram;
++    bool is_mapped;
+     MshvMemoryRegion mshv_mr = {0};
+ 
+     size = align_section(section, &start_addr);
+     trace_mshv_set_phys_mem(add, section->mr->name, start_addr);
+ 
+     /*
+-     * If the memory device is a writable non-ram area, we do not
+-     * want to map it into the guest memory. If it is not a ROM device,
+-     * we want to remove mshv memory mapping, so accesses will trap.
++     * ROM devices (e.g. pflash) have ram=false, rom_device=true.
++     * In romd_mode, they behave like RAM and should be mapped.
++     * Outside romd_mode, accesses should trap to QEMU for emulation.
++     *
++     * For non-RAM, non-rom_device regions (writable MMIO), we never map.
++     * For rom_device regions not in romd_mode, we want them unmapped.
+      */
+     if (!memory_region_is_ram(area)) {
+         if (writable) {
+@@ -195,6 +219,15 @@ void mshv_set_phys_mem(MshvMemoryListener *mml, MemoryRegionSection *section,
+         return;
+     }
+ 
++    is_mapped = uaddr_is_mapped(mml, start_addr);
++
++    if (add && is_mapped) {
++        return;
++    }
++    if (!add && !is_mapped) {
++        return;
++    }
++
+     mr_offset = section->offset_within_region + start_addr -
+                 section->offset_within_address_space;
+ 
+@@ -210,4 +243,6 @@ void mshv_set_phys_mem(MshvMemoryListener *mml, MemoryRegionSection *section,
+         error_report("Failed to set memory region");
+         abort();
+     }
++
++    track_region(mml, start_addr, add);
+ }
+diff --git a/accel/mshv/mshv-all.c b/accel/mshv/mshv-all.c
+index d4cc7f5371..0a30149030 100644
+--- a/accel/mshv/mshv-all.c
++++ b/accel/mshv/mshv-all.c
+@@ -371,6 +371,7 @@ static void register_mshv_memory_listener(MshvState *s, MshvMemoryListener *mml,
+ 
+     mml->listener = mshv_memory_listener;
+     mml->listener.name = name;
++    mml->mapped_regions = g_hash_table_new(g_direct_hash, g_direct_equal);
+     memory_listener_register(&mml->listener, as);
+     for (i = 0; i < s->nr_as; ++i) {
+         if (!s->as[i].as) {
+diff --git a/include/system/mshv_int.h b/include/system/mshv_int.h
+index 35386c422f..4aa1b6962d 100644
+--- a/include/system/mshv_int.h
++++ b/include/system/mshv_int.h
+@@ -32,6 +32,7 @@ struct AccelCPUState {
+ 
+ typedef struct MshvMemoryListener {
+     MemoryListener listener;
++    GHashTable *mapped_regions;
+     int as_id;
+ } MshvMemoryListener;
+ 
+
+-- 
+2.34.1
+
+

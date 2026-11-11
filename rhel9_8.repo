@@ -1,0 +1,40 @@
+[rhel9-baseos]
+name=RHEL 9 BaseOS
+baseurl=https://cdn.redhat.com/content/eus/rhel9/9.8/x86_64/baseos/os
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+sslverify=1
+sslcacert=/etc/rhsm/ca/redhat-uep.pem
+sslclientcert=/run/secrets/entcrt
+sslclientkey=/run/secrets/entkey
+[rhel9-appstream]
+name=RHEL 9 AppStream
+baseurl=https://cdn.redhat.com/content/eus/rhel9/9.8/x86_64/appstream/os
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+sslverify=1
+sslcacert=/etc/rhsm/ca/redhat-uep.pem
+sslclientcert=/run/secrets/entcrt
+sslclientkey=/run/secrets/entkey
+[rhel9-crb]
+name=RHEL 9 CodeReady Builder
+baseurl=https://cdn.redhat.com/content/eus/rhel9/9.8/x86_64/codeready-builder/os
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+sslverify=1
+sslcacert=/etc/rhsm/ca/redhat-uep.pem
+sslclientcert=/run/secrets/entcrt
+sslclientkey=/run/secrets/entkey
+[rhel9-appstream-source]
+name=RHEL 9 AppStream Source
+baseurl=https://cdn.redhat.com/content/eus/rhel9/9.8/x86_64/appstream/source/SRPMS
+enabled=1
+gpgcheck=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
+sslverify=1
+sslcacert=/etc/rhsm/ca/redhat-uep.pem
+sslclientcert=/run/secrets/entcrt
+sslclientkey=/run/secrets/entkey

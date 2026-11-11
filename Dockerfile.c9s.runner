@@ -54,14 +54,14 @@ COPY --from=payload-builder /tmp/cidata.img /var/lib/qemu/
 
 ENTRYPOINT ["/usr/libexec/qemu-kvm"]
 CMD ["-accel", "mshv", \
-    "-display", "none", \
-    "-m", "2048", \
-    "-smp", "2", \
-    "-serial", "file:/var/run/qemu/logs/serial.log", \
-    "-drive", "file=/var/lib/qemu/os-image.qcow2,format=qcow2,if=none,id=os", \
-    "-device", "virtio-blk-pci,drive=os", \
-    "-nographic", \
-    "-drive", "file=/var/lib/qemu/cidata.img,format=raw,if=none,id=cidata", \
-    "-device", "virtio-blk-pci,drive=cidata", \
-    "-netdev", "type=user,id=user-net,hostfwd=tcp::2222-:22", \
-    "-device", "virtio-net,mac=00:10:20:30:40:50,netdev=user-net"]
+     "-display", "none", \
+     "-m", "2048", \
+     "-smp", "2", \
+     "-serial", "file:/var/run/qemu/logs/serial.log", \
+     "-drive", "file=/var/lib/qemu/os-image.qcow2,format=qcow2,if=none,id=os", \
+     "-device", "virtio-blk-pci,drive=os", \
+     "-nographic", \
+     "-drive", "file=/var/lib/qemu/cidata.img,format=raw,if=none,id=cidata", \
+     "-device", "virtio-blk-pci,drive=cidata", \
+     "-netdev", "type=user,id=user-net,hostfwd=tcp::2222-:22", \
+     "-device", "virtio-net,mac=00:10:20:30:40:50,netdev=user-net"]
